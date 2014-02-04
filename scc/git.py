@@ -605,7 +605,7 @@ class GitHubRepository(object):
             if self.org:
                 status = self.org.has_in_public_members(user)
             else:
-                status = False
+                status = user.login == self.gh.get_login()
         elif default == "mine":
             status = user.login == self.gh.get_login()
         elif default == "all":
@@ -1661,8 +1661,12 @@ created by a public member of the organization. Default: org.""")
         self.filters = {}
         self.filters["base"] = args.base
         self.filters["default"] = args.default
-        if args.default == "org":
+
+        self.log.debug(self.main_repo.origin.org)
+        if args.default == "org" and self.main_repo.origin.org:
             default_user = "any public member of the organization"
+        elif args.default == "org" and not self.main_repo.origin.org:
+            default_user = "%s (no organisation)" % self.gh.get_login()
         elif args.default == "mine":
             default_user = "%s" % self.gh.get_login()
         elif args.default == "all":
