@@ -148,6 +148,13 @@ def git_version(local=False):
 
 
 def git_config(name, user=False, local=False, value=None, config_file=None):
+    def run_git_config(args, env=None):
+        p = subprocess.Popen(args, stdout=subprocess.PIPE, env=env)
+        print args
+        value = p.communicate()[0]
+        p.stdout.close()
+        return value
+
     dbg = logging.getLogger("scc.config").debug
     try:
         pre_cmd = ["git", "config"]
@@ -164,10 +171,14 @@ def git_config(name, user=False, local=False, value=None, config_file=None):
         if config_file is not None:
             pre_cmd.extend(["-f", config_file])
 
-        p = subprocess.Popen(
-            pre_cmd + post_cmd, stdout=subprocess.PIPE)
-        value = p.communicate()[0]
-        p.stdout.close()
+        value = None
+        git_config = os.getenv('GIT_CONFIG')
+        if git_config:
+            value = run_git_config(pre_cmd + post_cmd)
+        if not value:
+            env = os.environ.copy()
+            env.pop('GIT_CONFIG')
+            value = run_git_config(pre_cmd + post_cmd, env)
         value = value.split("\n")[0].strip()
         if value:
             dbg("Found %s", name)
@@ -747,12 +758,17 @@ class GitHubRepository(object):
         if "#all" in whitelist:
             return True
 
-        if "#org" in whitelist:
+        if "#org" in whitelist or "#org+self" in whitelist:
             # Whitelist all public members of the organization
             if self.org and self.org.has_in_public_members(user):
                 return True
             # Whitelist the owner of a non-organization repository
             elif not self.org and user.login == self.get_owner():
+                return True
+
+        if "#org+self" in whitelist:
+            # Whitelist the current user
+            if user.login == self.gh.get_login():
                 return True
 
         for whitelist_user in whitelist:
@@ -1997,9 +2013,9 @@ class GitRepoCommand(GitHubCommand):
 
 def get_default_filters(default):
     filters = {}
-    if default == "org":
+    if default in ("org", "org+self"):
         filters["include"] = {
-            "user": ["#org"], "label": ["include"]}
+            "user": ["#" + default], "label": ["include"]}
         filters["exclude"] = {"label": ["exclude", "breaking"]}
     elif default == "none":
         filters["include"] = {}
@@ -2029,17 +2045,17 @@ class FilteredPullRequestsCommand(GitRepoCommand):
 KEY:VALUE or using a hash symbol, e.g. prefix#NUMBER. Recognized key/values \
 are label:LABEL, pr:NUMBER, user:USERNAME. For user keys, user:#org means \
 any public member of the repository organization and user:#all means any \
-user.  Filter values with a hash symbol allow to filter Pull Requests by \
-number, e.g. #NUMBER or ORG/REPO#NUMBER for the ORG/REPO submodule. If \
-neither  a key/value nor a hash symbol is found, the filter is considered a \
-label filter."""
+user, user:#org+self means #org plus the current user.  Filter values with a \
+hash symbol allow to filter Pull Requests by number, e.g. #NUMBER or \
+ORG/REPO#NUMBER for the ORG/REPO submodule. If neither  a key/value nor a \
+hash symbol is found, the filter is considered a label filter."""
         self.parser.add_argument(
             '--default', '-D', type=str,
-            choices=["none", "org", "all"], default="org",
+            choices=["none", "org", "all", "org+self"], default="org+self",
             help="""Specify the default set of filters to use. NONE means no \
 filter is preset. ORG sets user:#org, label:include as the default include \
 filters and label:exclude and label:breaking as the default exclude filets. \
-ALL sets user:#all as the default include filter. Default: ORG.""")
+ALL sets user:#all as the default include filter. Default: ORG+SELF.""")
         self.parser.add_argument(
             '--include', '-I', type=str, action='append',
             help='Filters to include Pull Requests. ' + filter_desc)
@@ -2089,11 +2105,13 @@ ALL sets user:#all as the default include filter. Default: ORG.""")
                           status_map[self.filters['status']])
 
     def get_user_desc(self, value):
-        if value == '#org':
+        if value in ('#org', '#org+self'):
             if self.main_repo.origin.org:
-                return 'any public member of the organization'
+                d = 'any public member of the organization'
             else:
-                return 'the repository owner'
+                d = 'the repository owner'
+            if value == '#org+self':
+                return d + ' and the current user'
         if value == '#all':
             return 'any user'
         return '%s' % value
