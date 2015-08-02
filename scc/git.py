@@ -1840,6 +1840,17 @@ class GitRepository(object):
             finally:
                 self.cd(self.path)
 
+    def list_commits_not_in(
+            self, topic_branch, main_branch, other_branch, *args):
+        """List commits in main..topic that aren't in other"""
+        branchpoint = self.merge_base(topic_branch, main_branch)
+        branchpoint2 = self.find_branching_point(topic_branch, main_branch)
+        assert branchpoint == branchpoint2
+        commits = self.communicate(
+            "git", "cherry", other_branch, topic_branch, branchpoint, *args)
+        commits = [c[1:] for c in commits.splitlines() if c[0] == '+']
+        return commits
+
     def __del__(self):
         # We need to make sure our logging wrappers are closed when this
         # instance's reference count hits zero and it is garbage collected.
@@ -3307,6 +3318,9 @@ class SyncRebase(GitRepoCommand):
         self.parser.add_argument(
             '--continue', action="store_true", dest="_continue",
             help="Continue from a failed rebase")
+        self.parser.add_argument(
+            '--info', action='store_true',
+            help='Display new commits but do not rebase them')
 
         self.parser.add_argument(
             'PR', type=int,
@@ -3324,7 +3338,8 @@ class SyncRebase(GitRepoCommand):
         try:
             self.syncrebase(args)
         finally:
-            self.main_repo.cleanup()
+            if not args.info:
+                self.main_repo.cleanup()
 
     def syncrebase(self, args):
 
@@ -3344,7 +3359,7 @@ class SyncRebase(GitRepoCommand):
         pr, new_branch, message = self.local_sync(
             args.PR, parse, args.remote, args._continue)
 
-        if args.push:
+        if args.push and not args.info:
             try:
                 self.push_branch(pr, new_branch, message)
             finally:
@@ -3392,6 +3407,16 @@ class SyncRebase(GitRepoCommand):
             "Linked PR %g: %s opened by %s against %s", link,
             linked.get_title(), linked.get_user().name, linked.get_base())
 
+        commits = self.main_repo.list_commits_not_in(
+            linked.get_sha(), "%s/%s" % (remote, linked.get_base()), pr_head)
+        if commits:
+            self.log.info("Found new commits in #%g: %s", (
+                linked.get_number(), [c[:7] for c in commits]))
+        else:
+            raise Stop(22, "No new commits in #%g" % linked.get_number())
+
+        if args.info:
+            return
         if not skip:
             branching_sha1 = self.main_repo.find_branching_point(
                 linked.get_sha(), "%s/%s" % (remote, linked.get_base()))
@@ -3403,10 +3428,10 @@ class SyncRebase(GitRepoCommand):
 
         # Fail-fast if no new commits
         if self.main_repo.get_current_sha1() == pr_head:
-            raise Stop(22, "No new commits in #%g" % pr.get_number())
+            raise Stop(22, "No new commits in #%g" % linked.get_number())
 
         self.main_repo.new_branch(new_branch)
-        print >> sys.stderr, "# Created local branch %s" % new_branch
+        self.log.info("Created local branch %s", new_branch)
         message = "Commits added from #%g" % linked.get_number()
         self.log.info(message)
 
