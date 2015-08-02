@@ -605,6 +605,10 @@ class PullRequest(object):
         """Return the SHA1 of the head of the Pull Request."""
         return self.pull.head.sha
 
+    def get_ref(self):
+        """Return the branch containing the Pull Request."""
+        return self.pull.head.ref
+
     @retry_on_error(retries=SCC_RETRIES)
     def get_last_commit(self, ref="base"):
         """Return the head commit of the Pull Request.
@@ -1141,7 +1145,9 @@ class GitRepository(object):
         self.call("git", "fetch", remote)
 
     @retry_on_error(retries=SCC_RETRIES)
-    def push_branch(self, name, remote="origin", force=False):
+    def push_branch(self, name, remote="origin", dest=None, force=False):
+        if dest:
+            name += ":%s" % dest
         self.dbg("Pushing branch %s to %s..." % (name, remote))
         if force:
             self.call("git", "push", "-f", remote, name)
@@ -3260,6 +3266,201 @@ This is the same as gh-%(id)s but rebased onto %(base)s.
         msg += '4) repeat steps 1-3 until all conflicts are resolved\n'
         msg += '5) run "scc rebase --continue %s %s"\n\n' \
             % (pr, newbase)
+        msg += 'To stop rebasing,\n'
+        msg += '1) run "git rebase --abort"\n'
+        msg += '2) checkout the desired branch, e.g "git checkout master"'
+        return msg
+
+
+class SyncRebase(GitRepoCommand):
+    """Synchronise a rebased Pull Request with it's linked PR.
+
+        This is useful when a PR has been rebased before being merged,
+        and additional commits ahve been made to the original PR.
+
+        The workflow currently is:
+
+        1) Check if syncing has been disabled with --no-sync.
+        2) Find all --rebased-from and --rebased-to links (in that order)
+        3) Create a new temporary branch
+        4) Rebase commits from the first link that aren't in this PR.
+        5) If push is set, push to GH
+    """
+
+    NAME = "sync-rebase"
+
+    def __init__(self, sub_parsers):
+        super(SyncRebase, self).__init__(sub_parsers)
+
+        self.parser.add_argument(
+            '--no-fetch', action='store_true',
+            help="Do not fetch the origin remote")
+        for name, help in (
+                ('to', 'Ignore commits in --rebased-to PRs'),
+                ('from', 'Ignore commits in --rebased-from PRs'),
+                ('push', 'Skip pushing to GitHub'),
+                ('delete', 'Skip deleting local branch')):
+
+            self.parser.add_argument(
+                '--no-%s' % name, action='store_false',
+                dest=name, default=True, help=help)
+        self.parser.add_argument(
+            '--continue', action="store_true", dest="_continue",
+            help="Continue from a failed rebase")
+
+        self.parser.add_argument(
+            'PR', type=int,
+            help="The number of the pull request to synchronise")
+
+    def __call__(self, args):
+        super(SyncRebase, self).__call__(args)
+        self.login(args)
+
+        args.shallow = True
+        args.reset = False
+        self.init_main_repo(args)
+        if not args.no_fetch:
+            self.main_repo.fetch(args.remote)
+        try:
+            self.syncrebase(args)
+        finally:
+            self.main_repo.cleanup()
+
+    def syncrebase(self, args):
+
+        # If we are pushing the branch somewhere, we likely will
+        # be deleting the new one, and so should remember what
+        # commit we are on now in order to go back to it.
+        try:
+            old_branch = self.main_repo.get_current_head()
+        except:
+            old_branch = self.main_repo.get_current_sha1()
+
+        parse = []
+        if getattr(args, 'from'):
+            parse.append('rebased-from')
+        if args.to:
+            parse.append('rebased-to')
+        pr, new_branch, message = self.local_sync(
+            args.PR, parse, args.remote, args._continue)
+
+        if args.push:
+            try:
+                self.push_branch(pr, new_branch, message)
+            finally:
+                self.main_repo.checkout_branch(old_branch)
+
+            if args.delete:
+                self.main_repo.delete_local_branch(new_branch, force=True)
+
+    def local_sync(self, pr_number, parse, remote="origin", skip=False):
+        try:
+            pr = PullRequest(self.main_repo.origin.get_pull(pr_number))
+            self.log.info("PR %g: %s opened by %s against %s", pr_number,
+                          pr.get_title(), pr.head.user.name, pr.get_base())
+        except github.GithubException:
+            raise Stop(16, 'Cannot find pull request %g' % pr_number)
+
+        links = self.get_linked_prs(pr, parse)
+        if not links:
+            raise Stop(20, "No linked PRs found")
+        if len(links) > 1:
+            self.log.warn(
+                "Multiple linked PRs found, checking #%g, ignoring %s",
+                links[0], links[1:])
+        link = links[0]
+
+        pr_head = pr.get_sha()
+        self.log.info("Head: %s", pr_head[0:6])
+        self.log.info("Merged: %s", pr.is_merged())
+
+        # Fail-fast if bad object
+        if not self.main_repo.has_local_object(pr_head):
+            raise Stop(17, 'Commit %s does not exist in local Git '
+                       'repository. Fetch this remote first: %s'
+                       % (pr_head, pr.head.user.login))
+
+        # Fail-fast if local branch exists with the target name
+        new_branch = "sync-rebased/%s" % pr.get_number()
+        if self.main_repo.has_local_branch(new_branch):
+            raise Stop(18, 'Branch %s already exists in local Git repository'
+                       % new_branch)
+
+        message = ""
+        linked = PullRequest(self.main_repo.origin.get_pull(link))
+        self.log.info(
+            "Linked PR %g: %s opened by %s against %s", link,
+            linked.get_title(), linked.get_user().name, linked.get_base())
+
+        if not skip:
+            branching_sha1 = self.main_repo.find_branching_point(
+                linked.get_sha(), "%s/%s" % (remote, linked.get_base()))
+
+            try:
+                self.main_repo.rebase(pr_head, branching_sha1, linked.head.ref)
+            except:
+                raise Stop(20, self.get_conflict_message(pr_number))
+
+        # Fail-fast if no new commits
+        if self.main_repo.get_current_sha1() == pr_head:
+            raise Stop(22, "No new commits in #%g" % pr.get_number())
+
+        self.main_repo.new_branch(new_branch)
+        print >> sys.stderr, "# Created local branch %s" % new_branch
+        message = "Commits added from #%g" % linked.get_number()
+        self.log.info(message)
+
+        return pr, new_branch, message
+
+    def push_branch(self, pr, new_branch, message):
+        """
+        Push the updated PR, requires write permissions on the PR branch
+        """
+        pruser = pr.get_head_login()
+        remote = pr.get_head_repo().ssh_url
+        prbranch = pr.get_ref()
+
+        push_msg = ""
+        if pruser in self.main_repo.list_remotes():
+            try:
+                self.main_repo.push_branch(
+                    new_branch, remote=pruser, dest=prbranch)
+                push_msg = "# Pushed %s/%s" % (pruser, prbranch)
+            except:
+                self.log.info('Could not push to remote %s' % pruser)
+
+        if not push_msg:
+            self.main_repo.push_branch(
+                new_branch, remote=remote, dest=prbranch)
+            push_msg = "# Pushed %s to %s" % (prbranch, remote)
+        pr.create_issue_comment(message)
+        print >> sys.stderr, push_msg
+
+    def get_linked_prs(self, pr, parse):
+        dont_sync = pr.parse(['dont-sync'])
+        if dont_sync:
+            return
+
+        targets = []
+        pattern = r" #(\d+)"
+        rebased = []
+        for p in parse:
+            rebased.extend(pr.parse(p))
+        for link in rebased:
+            try:
+                targets.append(int(re.match(pattern, link).group(1)))
+            except (AttributeError, ValueError):
+                self.log.error('Failed to parse PR: %s', link)
+        return targets
+
+    def get_conflict_message(self, pr):
+        msg = 'Rebasing failed\nYou are now in detached HEAD mode\n\n'
+        msg += 'To keep on rebasing,\n'
+        msg += '1) check the output of "git status" and fix the conflicts\n'
+        msg += '2) re-add the conflicting files with "git add"\n'
+        msg += '3) run "git rebase --continue"\n'
+        msg += '4) repeat steps 1-3 until all conflicts are resolved\n'
+        msg += '5) run "scc rebase --continue %s"\n\n' % pr
         msg += 'To stop rebasing,\n'
         msg += '1) run "git rebase --abort"\n'
         msg += '2) checkout the desired branch, e.g "git checkout master"'

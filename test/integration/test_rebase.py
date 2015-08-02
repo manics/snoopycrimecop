@@ -21,7 +21,7 @@
 
 import pytest
 from yaclifw.framework import main, Stop
-from scc.git import Rebase
+from scc.git import Rebase, SyncRebase
 from Sandbox import SandboxTest
 from subprocess import Popen
 
@@ -207,3 +207,49 @@ class TestConflictingRebase(RebaseTest):
 
         self.rebase("--continue")
         assert self.has_rebased_pr()
+
+
+class TestSyncRebase(RebaseTest):
+
+    def setup_method(self, method):
+
+        super(TestSyncRebase, self).setup_method(method)
+
+        # Open first PR against dev_4_4 branch
+        self.source_branch = self.fake_branch(head=self.source_base)
+        self.pr = self.open_pr(self.source_branch, self.source_base)
+
+        # Define target branch for rebasing PR
+        self.target_branch = "rebased/%s/%s" \
+            % (self.target_base, self.source_branch)
+        self.rebase()
+        assert self.has_rebased_pr()
+        self.rebasedpr = self.sandbox.origin.get_pulls()[0]
+
+    def syncrebase(self, *args):
+        args = ["sync-rebase", "--no-ask", str(self.rebasedpr.number)
+                ] + list(args)
+        main("scc", args=args, items=[(SyncRebase.NAME, SyncRebase)])
+
+    def testDefault(self):
+        self.sandbox.checkout_branch(self.source_branch)
+        name = self.uuid()
+        with open(name, "w") as f:
+            f.write("hi")
+        self.sandbox.add(name)
+        message = "1: Writing %s" % name
+        self.sandbox.commit(message)
+        self.sandbox.get_status()
+        self.push_branch(self.source_branch)
+
+        updated = self.pr.update()
+        assert updated
+        prcommits = self.pr.get_commits()
+        assert prcommits.reversed[0].commit.message == message
+
+        # Sync the PR and push to Github
+        self.syncrebase()
+        updated = self.rebasedpr.update()
+        assert updated
+        rebasedcommits = self.rebasedpr.get_commits()
+        assert rebasedcommits.reversed[0].commit.message == message
