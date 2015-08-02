@@ -231,6 +231,11 @@ class TestSyncRebase(RebaseTest):
                 ] + list(args)
         main("scc", args=args, items=[(SyncRebase.NAME, SyncRebase)])
 
+    def testSame(self):
+        with pytest.raises(Stop) as exc:
+            self.syncrebase()
+        assert exc.value.message == 'No new commits in #%g' % self.pr.number
+
     def testDefault(self):
         self.sandbox.checkout_branch(self.source_branch)
         name = self.uuid()
